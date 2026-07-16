@@ -17,8 +17,9 @@ No global command palette: actions live where their context is.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from functools import partial
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING
 
 from textual.app import ComposeResult
 from textual.binding import Binding
@@ -51,7 +52,7 @@ class DashboardScreen(Screen):
         Binding("k", "cursor_up", show=False),
     ]
 
-    app: "CswapApp"
+    app: CswapApp
 
     def __init__(self) -> None:
         super().__init__()
@@ -114,8 +115,7 @@ class DashboardScreen(Screen):
         menu = self.query_one("#menu", ListView)
         await menu.clear()
         await menu.extend(
-            MenuItem(label, action_id, muted=(action_id == "back"))
-            for label, action_id in entries
+            MenuItem(label, action_id, muted=(action_id == "back")) for label, action_id in entries
         )
         menu.index = 0
 
@@ -175,7 +175,7 @@ class AccountListScreen(Screen):
     selection on demand.
     """
 
-    app: "CswapApp"
+    app: CswapApp
 
     def __init__(self) -> None:
         super().__init__()
@@ -202,12 +202,10 @@ class AccountListScreen(Screen):
             await listview.extend(AccountItem(acc) for acc in snap.accounts)
             self._numbers = numbers
             listview.index = (
-                self._index_after_build(snap, first_build, previous)
-                if numbers
-                else None
+                self._index_after_build(snap, first_build, previous) if numbers else None
             )
         else:
-            for item, acc in zip(listview.query(AccountItem), snap.accounts):
+            for item, acc in zip(listview.query(AccountItem), snap.accounts, strict=False):
                 item.set_account(acc)
         self._flash_updated(snap, listview)
 
@@ -221,11 +219,7 @@ class AccountListScreen(Screen):
 
     def _active_index(self, snap: AccountsSnapshot) -> int:
         return next(
-            (
-                i
-                for i, acc in enumerate(snap.accounts)
-                if acc.number == snap.active_number
-            ),
+            (i for i, acc in enumerate(snap.accounts) if acc.number == snap.active_number),
             0,
         )
 

@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import json
 import os
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import Enum, auto
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -156,9 +155,7 @@ class SwitchTransaction:
                 if step == "credentials_written":
                     switcher._write_credentials(self.original_credentials)
                 elif step == "config_written":
-                    self.config_path.write_text(
-                        self.original_config, encoding="utf-8"
-                    )
+                    self.config_path.write_text(self.original_config, encoding="utf-8")
                     if sys.platform != "win32":
                         os.chmod(self.config_path, 0o600)
                 elif step == "sequence_updated":
@@ -176,4 +173,4 @@ class SwitchTransaction:
 
 def get_timestamp() -> str:
     """Get current UTC timestamp in ISO format."""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")

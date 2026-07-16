@@ -8,7 +8,7 @@ the single ``json.dumps`` (see cli.py).
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from claude_swap import oauth
 
@@ -109,9 +109,7 @@ def account_ref(number: int | None, email: str) -> dict:
     return {"number": number, "email": email}
 
 
-def usage_freshness_fields(
-    fetched_at: float | None, age_s: float | None
-) -> dict:
+def usage_freshness_fields(fetched_at: float | None, age_s: float | None) -> dict:
     """Additive ``usageFetchedAt``/``usageAgeSeconds`` fields describing how
     old the served ``usage`` measurement is (the store may serve last-good
     data on fetch failure). Emitted only alongside a non-null ``usage``."""
@@ -119,7 +117,7 @@ def usage_freshness_fields(
         return {}
     fields: dict = {
         "usageFetchedAt": (
-            datetime.fromtimestamp(fetched_at, tz=timezone.utc)
+            datetime.fromtimestamp(fetched_at, tz=UTC)
             .isoformat(timespec="seconds")
             .replace("+00:00", "Z")
         )

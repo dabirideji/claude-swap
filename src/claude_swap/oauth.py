@@ -8,7 +8,7 @@ import urllib.error
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from claude_swap.printer import warning as print_warning
 
@@ -44,7 +44,7 @@ def is_oauth_token_expired(expires_at: object) -> bool:
     if not isinstance(expires_at, (int, float)):
         return False
 
-    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
     return now_ms + OAUTH_EXPIRY_BUFFER_MS >= int(expires_at)
 
 
@@ -80,11 +80,13 @@ def try_refresh_oauth_credentials(credentials: str) -> RefreshOutcome:
         return RefreshOutcome(None, "no_refresh_token")
 
     try:
-        body = json.dumps({
-            "grant_type": "refresh_token",
-            "refresh_token": oauth["refreshToken"],
-            "client_id": OAUTH_CLIENT_ID,
-        }).encode()
+        body = json.dumps(
+            {
+                "grant_type": "refresh_token",
+                "refresh_token": oauth["refreshToken"],
+                "client_id": OAUTH_CLIENT_ID,
+            }
+        ).encode()
 
         req = urllib.request.Request(
             OAUTH_TOKEN_URL,
@@ -98,7 +100,7 @@ def try_refresh_oauth_credentials(credentials: str) -> RefreshOutcome:
         with urllib.request.urlopen(req, timeout=10) as resp:
             resp_data = json.loads(resp.read().decode())
 
-        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        now_ms = int(datetime.now(UTC).timestamp() * 1000)
         oauth["accessToken"] = resp_data["access_token"]
         oauth["expiresAt"] = now_ms + resp_data["expires_in"] * 1000
         if resp_data.get("refresh_token"):
@@ -115,9 +117,7 @@ def try_refresh_oauth_credentials(credentials: str) -> RefreshOutcome:
         # an explicit marker in the body. Anything ambiguous stays transient —
         # a misclassified transient costs one retry, a misclassified permanent
         # would wrongly quarantine a live token.
-        if e.code in (400, 401, 403) and (
-            "invalid_grant" in body or "invalid_client" in body
-        ):
+        if e.code in (400, 401, 403) and ("invalid_grant" in body or "invalid_client" in body):
             return RefreshOutcome(None, "invalid_grant")
         return RefreshOutcome(None, "transient")
     except Exception as e:
@@ -128,7 +128,6 @@ def try_refresh_oauth_credentials(credentials: str) -> RefreshOutcome:
 def refresh_oauth_credentials(credentials: str) -> str | None:
     """Refresh an OAuth access token; None on any failure (see RefreshOutcome)."""
     return try_refresh_oauth_credentials(credentials).credentials
-
 
 
 def build_token_status(credentials: str) -> str | None:
@@ -144,7 +143,7 @@ def build_token_status(credentials: str) -> str | None:
     if not isinstance(expires_at, (int, float)):
         return f"oauth: unknown expiry, refresh token {refresh_str}"
 
-    expires_utc = datetime.fromtimestamp(expires_at / 1000, tz=timezone.utc)
+    expires_utc = datetime.fromtimestamp(expires_at / 1000, tz=UTC)
     state = "expired" if is_oauth_token_expired(expires_at) else "fresh"
     countdown, clock = format_reset(expires_utc.isoformat())
     return f"oauth: {state}, refresh token {refresh_str}, expires {clock} in {countdown}"
@@ -153,7 +152,7 @@ def build_token_status(credentials: str) -> str | None:
 def format_reset(resets_at: str) -> tuple[str, str]:
     """Return (countdown, clock) for a reset time in local time."""
     reset_utc = datetime.fromisoformat(resets_at)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     remaining = reset_utc - now
     total_seconds = max(0, int(remaining.total_seconds()))
     days, remainder = divmod(total_seconds, 86400)
@@ -258,7 +257,6 @@ def _log_usage_failure(
         cause += " (burst block — cswap's own polling cannot trigger this)"
     _logger.warning("Usage fetch failed%s: %s", where, cause)
     _logger.debug("Usage fetch failure detail%s: %r", where, e)
-
 
 
 def build_usage_result(data: dict) -> dict | None:
@@ -420,12 +418,7 @@ def try_fetch_usage_for_account(
         return UsageOutcome(build_usage_result(data))
     except urllib.error.HTTPError as e:
         kind, retry_after = _classify_usage_error(e)
-        if (
-            e.code != 401
-            or is_active
-            or not oauth
-            or not oauth.get("refreshToken")
-        ):
+        if e.code != 401 or is_active or not oauth or not oauth.get("refreshToken"):
             _log_usage_failure(context, e, kind, retry_after)
             return UsageOutcome(None, error=kind, retry_after_s=retry_after)
 
