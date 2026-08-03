@@ -99,6 +99,11 @@ CANDIDATE_MAX_INTERVAL_S = 600.0
 ACTIVE_MAX_INTERVAL_S = 180.0
 ACTIVE_RELAX_DISTANCE_PCT = 25.0  # 2× interval beyond this; cap beyond 2× this
 
+# A 5h window, once started, always runs its full course — never re-ping an
+# account within this long of our own last successful ping (see
+# AutoSwitchEngine._prewarm_idle_reserves).
+PREWARM_GUARD_S = 5 * 3600.0
+
 
 def _now_iso() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
@@ -251,6 +256,19 @@ class UnquarantineEvent(AutoSwitchEvent):
 
 
 @dataclass(frozen=True)
+class PreWarmEvent(AutoSwitchEvent):
+    kind: ClassVar[str] = "account-prewarmed"
+    number: str
+    email: str
+
+    def _fields(self) -> dict:
+        return {"number": self.number, "email": self.email}
+
+    def human(self) -> str:
+        return f"pre-warmed Account-{self.number} ({self.email}): 5h window started early"
+
+
+@dataclass(frozen=True)
 class AllExhaustedEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "all-exhausted"
     earliest_reset_at: str | None
@@ -363,6 +381,24 @@ def _window_reset_ts(window: dict) -> float | None:
 
 def _ref(number: str, email: str) -> dict:
     return {"number": int(number), "email": email}
+
+
+def _is_truly_idle(usage: dict | str | None) -> bool:
+    """No 5h window running at all (never used, or its last window fully
+    expired) — as opposed to a window that merely reads 0% used so far.
+
+    ``build_usage_result`` only adds ``resets_at`` when the API includes one
+    for that window, so its absence is the signal: nothing is ticking. Gated
+    on ``pct`` too as a defensive belt-and-braces check, not because it's
+    expected to disagree.
+    """
+    if not isinstance(usage, dict):
+        return False
+    window = usage.get("five_hour")
+    if not isinstance(window, dict):
+        return False
+    pct = window.get("pct")
+    return "resets_at" not in window and isinstance(pct, (int, float)) and pct <= 0.0
 
 
 class AutoSwitchEngine:
@@ -593,6 +629,9 @@ class AutoSwitchEngine:
                 },
             )
         )
+
+        if settings.pre_warm_reserves and not self.dry_run:
+            self._prewarm_idle_reserves(current, quarantined, usage)
 
         if (
             self.switcher.account_kind_for(current) == "api_key"
@@ -979,6 +1018,59 @@ class AutoSwitchEngine:
             )
         )
         return TickOutcome.SWITCHED
+
+    def _prewarm_idle_reserves(
+        self, active_number: str, quarantined: set[str], usage: dict
+    ) -> None:
+        """Opt-in (``settings.pre_warm_reserves``): keep every idle reserve
+        account's 5h window starting as early as possible — every tick, not
+        gated on a switch having happened this session. The point is not to
+        wait for evidence of a burn: the earlier an idle account is pinged
+        relative to when it's actually needed, the sooner its own reset lands
+        once it's finally drained, which is what shrinks the "wait 5h to loop
+        back" dead zone at the end of a long session.
+
+        Only acts on ``usage`` already collected this tick — never forces an
+        extra fetch — so a candidate whose data happens to be stale here
+        simply gets caught on a later tick once its own poll comes due.
+
+        Guarded by ``PREWARM_GUARD_S`` (the fixed window length) against
+        re-pinging the same account: a tick cadence of tens of seconds would
+        otherwise refire on the same idle-looking cached entry repeatedly
+        before the adaptive scheduler ever refreshes that candidate's data
+        and sees the ping already took effect. Recorded in the same state
+        file as cooldown/quarantine, under the same lock.
+        """
+        state = self._read_state()
+        last_pinged = state.get("preWarmed")
+        last_pinged = last_pinged if isinstance(last_pinged, dict) else {}
+        now = self.clock()
+        for num in self.switcher.switchable_account_numbers():
+            if num == active_number or num in quarantined:
+                continue
+            if self.switcher.account_kind_for(num) == "api_key":
+                continue
+            if not _is_truly_idle(usage.get(num)):
+                continue
+            guarded_since = last_pinged.get(num)
+            if isinstance(guarded_since, (int, float)) and now - guarded_since < PREWARM_GUARD_S:
+                continue
+            email = self.switcher.account_email(num)
+            if not email or self.switcher.live_session_pids_for(num, email):
+                continue  # unmanaged slot, or a live `cswap run` owns its token
+            creds = self.switcher.read_account_credentials(num, email)
+            if not creds:
+                continue
+            outcome = oauth.try_prewarm_account(
+                num, email, creds, persist_credentials=self.switcher.persist_backup_credentials
+            )
+            if outcome.ok:
+
+                def record(state: dict, n=num, t=now) -> None:
+                    state.setdefault("preWarmed", {})[n] = t
+
+                self._mutate_state(record)
+                self._emit(PreWarmEvent(number=num, email=email))
 
     # -- helpers --------------------------------------------------------------
 
