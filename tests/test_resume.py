@@ -5,6 +5,7 @@ session, inbox and clock faked out."""
 from __future__ import annotations
 
 import json
+import sys
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
@@ -520,6 +521,74 @@ def test_waiting_records_are_never_pruned(backup):
     assert rs.load_record(backup, SID) is not None
 
 
+class TestOrphanedWaitingRecords:
+    """A sign-out or reboot kills waiters mid-wait (2026-11-03: Windows'
+    Fast Startup "shut down" at 10:18 left two records `waiting` for good)."""
+
+    def _orphan(self, backup, tmp_path, *records: dict, **fields) -> None:
+        transcript = write(tmp_path / "t.jsonl", human("h1", 900.0), *records)
+        record = _record(transcript_path=str(transcript), **fields)
+        rs.mutate_record(backup, SID, lambda _: record)
+
+    def _reconcile(self, backup, sessions=()) -> ResumeRecord:
+        with patch.object(rs, "list_sessions", return_value=list(sessions)):
+            rs.reconcile_orphans(backup, 9000.0)
+        record = rs.load_record(backup, SID)
+        assert record is not None
+        return record
+
+    def test_a_session_that_carried_on_is_finished_as_moved_on(self, backup, tmp_path):
+        self._orphan(backup, tmp_path, limit_stop("s1", 1000.0), assistant("a1", 2000.0))
+        record = self._reconcile(backup, [_session("busy")])
+        assert record.state == rs.MOVED_ON
+        assert record.updated_at == 9000.0
+
+    def test_a_session_no_longer_running_is_finished_as_gone(self, backup, tmp_path):
+        self._orphan(backup, tmp_path, limit_stop("s1", 1000.0))
+        assert self._reconcile(backup, []).state == rs.SESSION_GONE
+
+    def test_a_running_session_still_stopped_keeps_waiting(self, backup, tmp_path):
+        # Nothing to conclude: `resume status` flags the missing waiter.
+        self._orphan(backup, tmp_path, limit_stop("s1", 1000.0))
+        assert self._reconcile(backup, [_session()]).state == rs.WAITING
+
+    def test_a_live_waiter_keeps_its_record(self, backup, tmp_path):
+        # Mid-delivery: our own continue moved the session on; the waiter
+        # records `resumed` once it confirms.
+        self._orphan(backup, tmp_path, limit_stop("s1", 1000.0), assistant("a1", 2000.0))
+        lock = rs._waiter_lock(backup, SID)
+        assert lock.acquire(timeout=0)
+        try:
+            assert self._reconcile(backup, [_session("busy")]).state == rs.WAITING
+        finally:
+            lock.release()
+
+    def test_a_live_stopped_session_never_has_its_waiter_lock_probed(self, backup, tmp_path):
+        # A waiter just starting must never lose its lock to the probe.
+        self._orphan(backup, tmp_path, limit_stop("s1", 1000.0))
+        with (
+            patch.object(rs, "list_sessions", return_value=[_session()]),
+            patch.object(rs, "waiter_alive", side_effect=AssertionError("probed")),
+        ):
+            rs.reconcile_orphans(backup, 9000.0)
+
+    def test_rehearsals_are_left_to_their_waiter(self, backup, tmp_path):
+        self._orphan(
+            backup, tmp_path, limit_stop("s1", 1000.0), assistant("a1", 2000.0), rehearsal=True
+        )
+        assert self._reconcile(backup, []).state == rs.WAITING
+
+    def test_any_sessions_hook_finishes_another_sessions_orphan(self, backup, env_home, tmp_path):
+        self._orphan(backup, tmp_path, limit_stop("s1", 1000.0), assistant("a1", 2000.0))
+        other = "0000aaaa-1111-4222-8333-444455556666"
+        stopped = write(tmp_path / "other.jsonl", human("h9", 5000.0), limit_stop("s9", 6000.0))
+        hook = {**_hook_input(stopped), "session_id": other}
+        with patch.object(rs, "list_sessions", return_value=[_session("busy")]):
+            assert arm(backup, hook, ENV, clock=lambda: 6001.0, spawn=lambda _sid: None) == "armed"
+        assert rs.load_record(backup, SID).state == rs.MOVED_ON
+        assert rs.load_record(backup, other).state == rs.WAITING
+
+
 class TestDeliveryConfirmation:
     def test_unrecorded_message_is_reported_undelivered(self, backup, stalled_transcript):
         h = WaiterHarness(backup, stalled_transcript, _record(), LiveContext(identity=B))
@@ -720,3 +789,110 @@ class TestIntentWaiter:
         h.waiter.sleep = jitter_sleep
         assert h.run() == rs.CANCELLED
         assert h.posted == []
+
+
+# ---------------------------------------------------------------------------
+# Regressions from the 2026-11-03 episode: waiter windows, queued deliveries
+# ---------------------------------------------------------------------------
+
+
+class TestWaiterSpawnHasNoWindow:
+    @pytest.mark.skipif(sys.platform != "win32", reason="Windows creation flags")
+    def test_no_window_and_never_detached(self):
+        import subprocess
+
+        with patch.object(rs.subprocess, "Popen") as popen:
+            rs.spawn_waiter(SID)
+        flags = popen.call_args.kwargs["creationflags"]
+        assert flags & subprocess.CREATE_NO_WINDOW
+        # DETACHED_PROCESS leaves the pipx launcher's child to open a visible console.
+        assert not flags & subprocess.DETACHED_PROCESS
+        assert flags & subprocess.CREATE_NEW_PROCESS_GROUP
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="Windows creation flags")
+    def test_falls_back_without_breakaway_still_windowless(self):
+        import subprocess
+
+        calls = []
+
+        def popen(cmd, **kwargs):
+            calls.append(kwargs["creationflags"])
+            if len(calls) == 1:
+                raise OSError("job does not allow breakaway")
+
+        with patch.object(rs.subprocess, "Popen", side_effect=popen):
+            rs.spawn_waiter(SID)
+        assert len(calls) == 2
+        assert calls[1] & subprocess.CREATE_NO_WINDOW
+        assert not calls[1] & subprocess.CREATE_BREAKAWAY_FROM_JOB
+
+    def test_flags_are_zero_off_windows(self):
+        with patch.object(rs.sys, "platform", "linux"):
+            assert rs.windows_spawn_flags() == 0
+
+
+class TestQueuedDeliveryConfirmation:
+    def test_marker_recorded_late_while_busy_is_confirmed(self, tmp_path):
+        transcript = write(tmp_path / "t.jsonl", limit_stop("s1", 1000.0))
+        clock = FakeClock(1000.0)
+
+        def sleep(seconds: float) -> None:
+            clock.sleep(seconds)
+            if clock.now >= 1000.0 + 75 and not getattr(sleep, "done", False):
+                sleep.done = True  # type: ignore[attr-defined]
+                with transcript.open("a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(peer_turn("m1", clock.now, rs.MARKER + " x")) + "\n")
+
+        assert rs.delivery_confirmed(
+            str(transcript), 1000.0, clock=clock, sleep=sleep, still_busy=lambda: True
+        )
+        assert clock.now >= 1075.0  # it waited past the 60 s base timeout
+
+    def test_idle_with_no_trace_is_still_undelivered(self, tmp_path):
+        transcript = write(tmp_path / "t.jsonl", limit_stop("s1", 1000.0))
+        clock = FakeClock(1000.0)
+        assert not rs.delivery_confirmed(
+            str(transcript), 1000.0, clock=clock, sleep=clock.sleep, still_busy=lambda: False
+        )
+        assert clock.now < 1000.0 + rs.CONFIRM_TIMEOUT_S + 5
+
+    def test_busy_forever_gives_up_at_the_cap(self, tmp_path):
+        transcript = write(tmp_path / "t.jsonl", limit_stop("s1", 1000.0))
+        clock = FakeClock(1000.0)
+        assert not rs.delivery_confirmed(
+            str(transcript), 1000.0, clock=clock, sleep=clock.sleep, still_busy=lambda: True
+        )
+        assert clock.now >= 1000.0 + rs.CONFIRM_BUSY_MAX_S
+
+    def test_waiter_counts_a_message_queued_behind_the_users_prompt(
+        self, backup, stalled_transcript
+    ):
+        # The 2026-11-03 saas-template case: the user typed as we posted, so
+        # our message was queued and only recorded ~70 s later.
+        h = WaiterHarness(backup, stalled_transcript, _record(), LiveContext(identity=B))
+        h.records_delivery = False
+        h.sessions = [_session("idle"), _session("idle"), _session("busy")]
+        original = h.clock.sleep
+        posted = {"at": None}
+        real_post = h._post
+
+        def post(address, text, token, timeout=5.0):
+            real_post(address, text, token, timeout)
+            posted["at"] = h.clock.now
+
+        h._post = post  # type: ignore[method-assign]
+
+        def sleep(seconds: float) -> None:
+            original(seconds)
+            if (
+                posted["at"] is not None
+                and h.clock.now >= posted["at"] + 70
+                and h.records_delivery is False
+            ):
+                h.records_delivery = None  # write once
+                with stalled_transcript.open("a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(peer_turn("q1", h.clock.now, rs.MARKER + " queued")) + "\n")
+
+        h.waiter.sleep = sleep
+        assert h.run() == rs.RESUMED
+        assert h.gave_up == []  # no false "undelivered" alarm

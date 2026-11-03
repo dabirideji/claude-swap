@@ -120,7 +120,10 @@ That's why the design is:
 5. It then checks that the session recorded the message. A message Claude
    Code holds or refuses leaves no trace. If nothing shows up within a
    minute, the session is marked `undelivered` and you get a notification
-   instead of a false "continued".
+   instead of a false "continued". If the session is busy at that point (you
+   typed something at the same moment, so the message is queued behind your
+   prompt), it keeps checking until the session goes idle, for up to 30
+   minutes.
 
 The waiter stops by itself when:
 
@@ -138,6 +141,38 @@ still work, with the session's own token.
 any work, that counts as consecutive. After `resume.maxConsecutive` (default 3)
 in a row, claude-swap stops and sends a notification instead of retrying
 forever. A prompt you type yourself resets the count.
+
+### A stop makes `cswap auto` switch at once
+
+A session stopping on a limit is first-hand proof that the account is spent.
+So `cswap auto` doesn't wait for the usage endpoint to agree. On its next
+tick (within `autoswitch.intervalSeconds`, 15 s on this machine) it leaves
+the account:
+
+- It decides on the usage it already has stored and makes no usage calls
+  first. In a network glitch, the endpoint is exactly what fails. Before this
+  change, unreadable usage meant three "usage unknown" ticks and then waiting
+  for a candidate to become readable again (found live on 2026-11-03: the
+  switch landed 80 s after three sessions stopped).
+- It picks the best account it can measure. If none is measurable, it lands
+  "blind" on the account whose last reading was lowest. Usage only rises
+  within a window, so an old reading is a floor. It skips accounts:
+  - that never had a reading;
+  - that the usage endpoint refuses (401/403, like a broken slot);
+  - whose last reading is already at a limit that hasn't reset;
+  - that a stopped session, or the account it just left, shows is spent.
+- If it guesses wrong, the session stops again when the waiter continues it
+  on that account. That stop names the account, and `cswap auto` moves on
+  again without going back. It can tell that stop from a late one on the old
+  account because Claude Code reports a different reset time for it.
+- Then the waiters continue the stopped sessions as usual (`account-switched`).
+
+It ignores stops from sessions that already carried on, from `cswap run`
+profiles and from rehearsals. In the first 60 s after its own switch it also
+ignores stops that report the old account's reset time: a running session can
+still be on the old account's token that long. This needs the `cswap auto`
+loop and the auto-continue hook. If the loop itself is stuck, nothing
+switches. Turn it off with `cswap config set resume.switchOnStop false`.
 
 ---
 
@@ -175,6 +210,7 @@ by a waiter.
 | `resume.notify` | `true` | desktop notification when a session is continued, held, or given up on |
 | `resume.enabled` | `true` | the master switch; `cswap resume off`/`on` set it |
 | `resume.maxWaitHours` | `24` | hold sessions stopped longer ago than this (0 = no cap) |
+| `resume.switchOnStop` | `true` | `cswap auto` leaves an account the moment a session stops on its limit |
 
 ```bash
 cswap config set resume.slackSeconds 300
@@ -200,6 +236,13 @@ cswap config set resume.slackSeconds 300
   permission you haven't granted will stop at the prompt, as usual.
 - **`cswap run` sessions** are pinned to one account, so for them only the
   limit's own reset counts, not account switches.
+- **Signing out, rebooting or "Shut down" ends the waiters.** Waiters run in
+  your Windows session. Fast Startup's "Shut down" signs you out too. A
+  session that was stopped then isn't continued automatically after it's
+  restored: type "continue" in it. Its stale `waiting` row clears itself the
+  next time any session hits a limit, or when you run `cswap resume status`
+  (`moved-on` if it carried on, `session-gone` if it isn't running). If it's
+  restored and still stopped, the row shows "waiter not running".
 - **Logs** go to `claude-swap.log` in the backup dir. Search for
   `auto-continue`.
 

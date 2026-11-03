@@ -23,7 +23,7 @@ do I use it", see [AUTO-CONTINUE.md](./AUTO-CONTINUE.md),
 | `oauth.py` | Token refresh, the usage API, and the pre-warm ping. |
 | `usage_store.py` | Cached usage per account (`cache/usage.json`): last good reading, failure backoff, poll schedule. |
 | `autoswitch.py` | The `cswap auto` engine: adaptive polling, when and where to switch, quarantine, pre-warm. |
-| `settings.py` | `settings.json`, with sections `autoswitch.*` and `resume.*`, validated through `SETTING_SPECS`. |
+| `settings.py` | `settings.json`, with sections `autoswitch.*`, `ui.*`, `run.*`, `updates.*`, `usage.*` and `resume.*`, validated through `SETTING_SPECS`. |
 | `claude_locks.py`, `locking.py` | Claude Code's own lock protocol (respected while swapping credentials), and cswap's file locks. |
 | `process_detection.py` | Running Claude Code sessions, read from `~/.claude/sessions/<pid>.json`. |
 | `session.py` | `cswap run` profiles (one account per terminal). |
@@ -320,6 +320,76 @@ Things to know:
   stopped on the same limit don't all start in the same second. It then
   re-checks that nobody typed in the meantime.
 
+### 4.6b Stops drive `cswap auto` (`resume.switchOnStop`)
+
+The waiter never switches, but `cswap auto` reads the same records.
+`resume.limit_stops()` returns the limits Claude Code itself reported, newest
+first, and the engine acts on them at the top of each tick, before any usage
+collection:
+
+| Filter (in `limit_stops`) | Why |
+|---|---|
+| `state == waiting` only | a session that carried on, or was continued, says nothing about the account now |
+| not `rehearsal`, default profile only | rehearsal stops are fakes; `cswap run` profiles are pinned to one account |
+| `resetsAt` still in the future (5 h trust when it isn't recorded) | the limit lifts at its own reset |
+| the transcript shows no work since the stop (`moved_on_since_stop`) | the record's state can lie: a waiter killed by a sign-out leaves it `waiting` |
+
+The engine (`_active_limit_stop`) then takes the newest stop whose identity is
+the active account and whose `stalledAt` is later than `lastSwitchAt`. An
+earlier stop belongs to the account it already left.
+
+Within `SWITCH_SETTLE_S` (60 s) of the switch, a stop may come from a session
+still on the old token: Windows and Linux sessions re-read the credentials
+file on change, and macOS caches the Keychain for ~30 s. So inside that window
+a stop counts only if its `resetsAt` differs from the departure's
+`leftRecoveryAt` by more than `SAME_RESET_TOLERANCE_S` (120 s), which makes it
+a different account's limit.
+
+Without this, a wrong landing would stick. The waiter continues sessions 0-50
+s after a switch (30 s poll plus 0-20 s jitter), so a spent landing account's
+stop lands inside the window, and its `stalledAt` never changes again.
+
+A re-stop's identity is right: the waiter exits once it delivers, so the next
+stop goes through `arm`, which reads the live login. A waiter still waiting
+keeps the arm-time identity for a new stall (`Waiter._note`), and that costs
+at most one extra cycle. Given a stop that counts:
+
+- It skips usage collection and pre-warm. It decides on
+  `usage_entries_by_account(fetch=set())`, the store as it stands, with no
+  network call before `_freshen_target`.
+- The trigger is `at-limit`, whatever the stale reading says: no cooldown, no
+  unhealthy-tick counting, and escape ranking.
+- If ranking finds nothing (no candidate readable), `_unmeasured_escape`
+  lands blind. This comes before API-key fallback, since those cost money.
+  - **Who qualifies:** unreadable candidates that have a `last_good` reading
+    and no `http-401`/`http-403` `last_error`.
+  - **Who is skipped:** accounts in `_known_spent`. That covers every account
+    a live stop names, plus `lastSwitchFrom` when it was left at
+    `leftHeadroom ≤ 0` before its `leftRecoveryAt`. A stop's own record stops
+    counting once its session is continued elsewhere.
+  - **Order:** usage is monotone within a window, so `last_good` is a floor
+    until its reset (`resume.window_pct`, which counts reset windows as 0).
+    Floors of 100% or more are skipped; the lowest goes first, with sequence
+    order breaking ties.
+  - `priority-consume-first` keeps its own freshness rule, so there the blind
+    landing usually holds.
+- The departure is recorded as `leftHeadroom: 0` and
+  `leftRecoveryAt: <reported resetsAt>`, so the no-return bar releases at the
+  real reset.
+- The decision goes to `claude-swap.log`:
+  `Session <id> stopped on account <n>'s <type> limit; leaving it now`.
+
+Known gap: `lastSwitchAt` is written only by engine switches. After a manual
+`cswap switch` onto an account that a live stop still names (before its
+reset), the engine leaves it again on the next tick.
+
+A tick slower than `SLOW_TICK_S` (120 s) logs
+`Auto-switch tick took <n>s (stalled?)`. On 2026-11-03 the S4U daemon
+printed nothing from 07:11 to 07:33 while the machine was awake (no sleep in
+the System log). Its next line still named the pre-07:27 account. Every
+network call and lock in the tick path has a timeout, so the cause is still
+open, and this warning is how the next one gets caught.
+
 ### 4.7 Loop guard
 
 - When a new stop follows one of our continues with **no** real output and
@@ -349,8 +419,16 @@ After posting, the waiter polls the transcript for up to 60 s for our marker
 `[claude-swap auto-continue]`. It only counts a **user turn's text**, or a
 **queued-command attachment's prompt** (a mid-turn delivery). Assistant
 output and tool results don't count: a session that edits cswap itself
-quotes the marker in its own tool calls (found live, 20 false matches). If no
-match shows up, the state becomes `undelivered` and you're notified.
+quotes the marker in its own tool calls (found live, 20 false matches). A
+queued prompt is stored as content blocks, so their text is joined first.
+
+A message that lands while the session is busy (say you typed at the same
+moment) is queued, and Claude Code records it only when the turn consumes
+it, which can be minutes later. So past 60 s the waiter keeps polling while
+the session is `busy` or `waiting`, for up to 30 minutes. Once the session is
+idle again with no match, the state becomes `undelivered` and you're notified.
+(Found live: a message queued behind a typed "carry on" was recorded after
+~70 s and was wrongly flagged `undelivered`.)
 
 ### 4.9 Idempotency and concurrency
 
@@ -367,15 +445,32 @@ match shows up, the state becomes `undelivered` and you're notified.
   second waiter exits at once.
 - **Record writes:** `arm` and the waiter both read-modify-write under
   `.records.lock`.
-- **The waiter process** is spawned detached and fully disowned:
-  - Windows: `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP |
+- **The waiter process** is spawned in the background and fully disowned:
+  - Windows: `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP |
     CREATE_BREAKAWAY_FROM_JOB`, falling back to no breakaway if the job
-    refuses.
+    refuses. Not `DETACHED_PROCESS`: a venv's `Scripts\python.exe` (pipx
+    installs) is a launcher that starts the real interpreter as a child, and
+    a console program started by a process with *no* console gets a new,
+    visible one. That was one empty terminal window per waiting session.
+    `CREATE_NO_WINDOW` gives the waiter a console without a window, which the
+    interpreter and the toast-notification PowerShell inherit. Toasts also
+    pass `CREATE_NO_WINDOW` themselves.
   - POSIX: `start_new_session`.
   - In both cases there's no inherited stdio, so it never holds Claude Code's
     hook pipes open.
 - **Pruning:** finished records older than 7 days are removed. Waiting
   records never are.
+- **Orphans** (`reconcile_orphans`, run by every `arm` and by `resume
+  status`): a sign-out or reboot kills waiters mid-wait. On 2026-11-03 a
+  Fast Startup "shut down" at 10:18 left two records `waiting` with no
+  waiter, for sessions that later carried on. A waiting record with no live
+  waiter is finished the way its waiter would have: `moved-on` when the
+  transcript shows work after the stop, `session-gone` when no process runs
+  it. Those two checks run first, and only then is the waiter lock probed.
+  So a waiter that is just starting (its session is live and stopped) never
+  loses its lock to the probe. A restored session that is still stopped
+  stays `waiting`. Nothing can continue it without a fresh hook, because its
+  new process has a new inbox and token.
 
 ### 4.10 Claude Code behaviours this relies on
 
@@ -544,14 +639,22 @@ This fork tracks [realiti4/claude-swap](https://github.com/realiti4/claude-swap)
 through a git remote called `upstream`. The first sync (2026-11-02) brought in
 393 upstream commits, going from v0.19 to v0.30.0b1.
 
+The second sync (2026-11-03) took 10 commits, up to `b14dfb9`: subscription
+plans in `cswap list`, setup-token header probes. All four conflicts were the
+same shape. Both sides added a settings section (upstream `usage`, the fork
+`resume`), so the fix is to keep both: the dataclass, the
+`_SECTION_DEFAULT_SOURCES` entry, the specs, the `effective_settings` loader,
+plus the key counts in `test_config_cli.py` (now 22) and the tail of
+`test_autoswitch.py`. Expect the same the next time upstream adds a section.
+
 **Keep the fork small.** The fork's own code is the files listed under
 `[tool.ruff] include` in `pyproject.toml` (auto-continue, notifications, their
 tests), plus small, well-marked insertions in upstream files:
 
 | Upstream file | Fork insertion |
 |---|---|
-| `settings.py` | `pre_warm_*` fields, `ResumeSettings`, the `resume` + pre-warm specs, `PRESETS` / `apply_preset`, `load_resume_settings` |
-| `autoswitch.py` | `PREWARM_GUARD_S`, `_prewarm_backoff_s`, `PreWarmEvent`, `_is_truly_idle`, the pre-warm call in `_tick_inner`, `_prewarm_idle_accounts` |
+| `settings.py` | `pre_warm_*` fields, `ResumeSettings` (incl. `switch_on_stop`), the `resume` + pre-warm specs, `PRESETS` / `apply_preset`, `load_resume_settings`, the `resume` entries in `_SECTION_DEFAULT_SOURCES` and `effective_settings` |
+| `autoswitch.py` | `PREWARM_GUARD_S`, `_prewarm_backoff_s`, `PreWarmEvent`, `_is_truly_idle`, the pre-warm call in `_tick_inner`, `_prewarm_idle_accounts`; limit stops (§4.6b): the `resume` import, `SLOW_TICK_S` / `SAME_RESET_TOLERANCE_S`, `_logged_stop`, the timing in `tick()`, the stop check before usage collection and the `limit_stop` branch in `_tick_inner` (plus its `left_snapshot` override and `_unmeasured_escape` call), `_limit_stops` / `_active_limit_stop` / `_known_spent` / `_unmeasured_escape` |
 | `oauth.py` | `op` parameter on `_log_usage_failure`; `PingOutcome` + `try_prewarm_account` at the end |
 | `switcher.py` | `read_live_credentials`, `cached_usage_entry`, `account_number_for_identity` |
 | `process_detection.py` | `messaging_socket_path`, `name`, `proc_start` on `ClaudeSession` |
@@ -614,10 +717,12 @@ Consequences:
 
 ### Roadmap (by impact)
 
-1. **Instant switch on a limit stop.** The hook could touch a "tick now" flag
-   that the `cswap auto` loop watches, so it switches right away instead of
-   waiting for the next poll (up to 15 s). Stops still happen today when a
-   burst outruns the poll.
+1. **Switch from the hook itself.** Since 2026-11-03 a stop makes the loop
+   switch on its next tick (§4.6b). That still depends on the loop ticking:
+   a stalled daemon (the 22-minute silence in §4.6b) can't act. The waiter
+   could run one engine tick itself when the stop names the live account.
+   It would need a guard against double switches with the loop: `_perform`
+   would re-check `current` under the state lock.
 2. **"Use it or lose it" strategy.** Among candidates with headroom, prefer
    the account whose window resets soonest, since its unused quota is lost at
    reset anyway. Today's only strategy, `best`, picks the most headroom.
